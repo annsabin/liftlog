@@ -22,9 +22,16 @@ import {
   Activity,
   BarChart3,
   Menu,
-  X
+  X,
+  AlertCircle,
+  LogOut,
+  User,
+  Edit3,
+  ArrowLeft,
+  RotateCcw,
+  Play
 } from 'lucide-react';
-import { format, differenceInDays, addDays, startOfDay, isSameDay } from 'date-fns';
+import { format, addDays, parseISO, startOfMonth, endOfMonth, eachDayOfInterval, isSameDay, isToday, addMonths } from 'date-fns';
 import { 
   LineChart, 
   Line, 
@@ -32,43 +39,124 @@ import {
   YAxis, 
   CartesianGrid, 
   Tooltip, 
-  ResponsiveContainer 
+  ResponsiveContainer,
+  AreaChart,
+  Area
 } from 'recharts';
 
 import { cn } from './lib/utils';
+import { supabase } from './lib/supabase';
 import { 
-  WorkoutType, 
-  Gym, 
-  WorkoutLog, 
-  AppState, 
+  WorkoutDay, 
+  WorkoutDayExercise, 
+  WorkoutSession, 
   ExerciseLog, 
   SetLog,
-  ExerciseVariation
+  CheckIn,
+  WorkoutDayOverride,
+  WorkoutExerciseOverride
 } from './types';
-import { TEN_DAY_PLAN, EXERCISES } from './constants';
 
-// --- Local Storage Helpers ---
-const STORAGE_KEY = 'liftlog_coach_state';
+// --- Utility Functions ---
 
-const getInitialState = (): AppState => {
-  const saved = localStorage.getItem(STORAGE_KEY);
-  if (saved) {
-    try {
-      return JSON.parse(saved);
-    } catch (e) {
-      console.error('Failed to parse saved state', e);
-    }
+function toLocalDateOnly(dateInput: Date | string) {
+  if (typeof dateInput === 'string' && dateInput.includes('-')) {
+    const [y, m, d] = dateInput.split('-').map(Number);
+    return new Date(y, m - 1, d);
   }
-  return {
-    gyms: [
-      { id: 'home', name: 'Home', equipment: { dumbbells: false, barbell: false, machines: false } },
-      { id: 'gym-a', name: 'Gym A', equipment: { dumbbells: true, barbell: true, machines: true } }
-    ],
-    selectedGymId: 'gym-a',
-    workoutLogs: [],
-    startDate: startOfDay(new Date()).toISOString()
-  };
-};
+  const d = new Date(dateInput);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function formatLocalYYYYMMDD(dateInput: Date | string) {
+  const d = toLocalDateOnly(dateInput);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// --- Core Data Logic ---
+
+async function getWorkoutDetailForDate(selectedDate: Date, userId: string | null) {
+  if (!userId) return null;
+  const dateKey = formatLocalYYYYMMDD(selectedDate);
+
+  try {
+    const { data, error } = await supabase.rpc('get_resolved_workout_for_date', { input_date: dateKey });
+    
+    console.log("RPC result:", data);
+    console.log("RPC error:", error);
+
+    if (error) {
+      console.error('[LiftLog] RPC error:', error);
+      return {
+        workout_date: dateKey,
+        workout_day_name: 'Error Loading',
+        is_error: true,
+        exercises: [],
+        has_overrides: false
+      };
+    }
+
+    if (!data || data.length === 0) {
+      return {
+        workout_date: dateKey,
+        workout_day_name: 'Rest Day',
+        is_rest_day: true,
+        exercises: [],
+        has_overrides: false
+      };
+    }
+
+    // If ANY row has is_rest_day = true, display "Rest Day"
+    const isRestDay = data.some((row: any) => row.is_rest_day);
+    if (isRestDay) {
+      return {
+        workout_date: dateKey,
+        workout_day_name: 'Rest Day',
+        is_rest_day: true,
+        exercises: [],
+        has_overrides: false
+      };
+    }
+
+    // Use the FIRST row to get workout_day_name and category
+    const firstRow = data[0];
+    const workoutDayName = firstRow.workout_day_name;
+    const category = firstRow.category;
+    const workoutDayId = firstRow.workout_day_id;
+
+    // Render ALL rows (sorted by sort_order) as the exercise list
+    const exercises = data.map((row: any) => ({
+      exercise_name: row.exercise_name,
+      target_sets: row.target_sets || 3,
+      target_reps: row.target_reps || '10',
+      notes: row.notes || '',
+      sequence_order: row.sort_order || 0,
+      is_overridden: row.exercise_source === 'override'
+    }));
+
+    return {
+      workout_date: dateKey,
+      workout_day_id: workoutDayId,
+      workout_day_name: workoutDayName || 'Workout Day',
+      workout_day_category: category,
+      is_rest_day: false,
+      exercises: exercises,
+      has_overrides: data.some((row: any) => row.exercise_source === 'override')
+    };
+  } catch (err) {
+    console.error('[LiftLog] Critical error in getWorkoutDetailForDate:', err);
+    return {
+      workout_date: dateKey,
+      workout_day_name: 'Error Loading',
+      is_error: true,
+      exercises: [],
+      has_overrides: false
+    };
+  }
+}
 
 // --- Components ---
 
@@ -83,13 +171,15 @@ const Button = ({
   onClick, 
   variant = 'primary', 
   className,
-  disabled
+  disabled,
+  type = 'button'
 }: { 
   children: React.ReactNode; 
   onClick?: () => void; 
   variant?: 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger';
   className?: string;
   disabled?: boolean;
+  type?: 'button' | 'submit' | 'reset';
 }) => {
   const variants = {
     primary: "bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-100",
@@ -101,10 +191,11 @@ const Button = ({
 
   return (
     <button 
+      type={type}
       onClick={onClick}
       disabled={disabled}
       className={cn(
-        "px-6 py-3 rounded-xl font-semibold transition-all active:scale-95 disabled:opacity-50 disabled:pointer-events-none shadow-md",
+        "px-6 py-3 rounded-xl font-semibold transition-all active:scale-95 disabled:opacity-50 disabled:pointer-events-none shadow-md flex items-center justify-center gap-2",
         variants[variant],
         className
       )}
@@ -120,7 +211,8 @@ const Input = ({
   onChange, 
   type = 'text', 
   placeholder,
-  className 
+  className,
+  required
 }: { 
   label?: string; 
   value: string | number; 
@@ -128,6 +220,7 @@ const Input = ({
   type?: string;
   placeholder?: string;
   className?: string;
+  required?: boolean;
 }) => (
   <div className={cn("flex flex-col gap-1.5", className)}>
     {label && <label className="text-sm font-medium text-slate-500 ml-1">{label}</label>}
@@ -136,844 +229,1108 @@ const Input = ({
       value={value}
       onChange={onChange}
       placeholder={placeholder}
+      required={required}
       className="px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
     />
   </div>
 );
 
-// --- Main App ---
+// --- Auth Component ---
 
-export default function App() {
-  const [state, setState] = useState<AppState>(getInitialState);
-  const [activeScreen, setActiveScreen] = useState<'home' | 'workout' | 'gyms' | 'progress' | 'plan' | 'settings'>('home');
-  const [currentWorkout, setCurrentWorkout] = useState<WorkoutLog | null>(null);
-  const [isMenuOpen, setIsMenuOpen] = useState(false);
+function Auth({ onAuthSuccess }: { onAuthSuccess: (userId: string) => void }) {
+  const [isSignUp, setIsSignUp] = useState(false);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }, [state]);
+  const handleAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
 
-  const currentDayIndex = useMemo(() => {
-    const today = startOfDay(new Date());
-    const start = startOfDay(new Date(state.startDate));
-    const diff = differenceInDays(today, start);
-    return diff % 10;
-  }, [state.startDate]);
-
-  const todayWorkoutType = TEN_DAY_PLAN[currentDayIndex];
-
-  const lastWorkout = useMemo(() => {
-    if (state.workoutLogs.length === 0) return null;
-    return [...state.workoutLogs].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())[0];
-  }, [state.workoutLogs]);
-
-  const getBestPerformance = (exerciseId: string) => {
-    let bestWeight = 0;
-    state.workoutLogs.forEach(log => {
-      log.exercises.forEach(ex => {
-        if (ex.exerciseId === exerciseId) {
-          ex.sets.forEach(set => {
-            if (set.weight > bestWeight) bestWeight = set.weight;
-          });
-        }
-      });
-    });
-    return bestWeight;
-  };
-
-  const getLastPerformance = (exerciseId: string) => {
-    const logs = [...state.workoutLogs].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-    for (const log of logs) {
-      const ex = log.exercises.find(e => e.exerciseId === exerciseId);
-      if (ex && ex.sets.length > 0) {
-        return ex.sets[ex.sets.length - 1];
+    try {
+      if (isSignUp) {
+        const { data, error } = await supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        if (data.user) onAuthSuccess(data.user.id);
+      } else {
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        if (data.user) onAuthSuccess(data.user.id);
       }
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
-    return null;
   };
-
-  const startWorkout = () => {
-    const gym = state.gyms.find(g => g.id === state.selectedGymId) || state.gyms[0];
-    const exercisesForType = EXERCISES[todayWorkoutType] || [];
-    
-    const initialExercises: ExerciseLog[] = exercisesForType.map(def => {
-      // Find suitable variation based on gym equipment
-      const variation = def.variations.find(v => {
-        if (v.equipment.includes('bodyweight')) return true;
-        if (v.equipment.includes('dumbbells') && gym.equipment.dumbbells) return true;
-        if (v.equipment.includes('barbell') && gym.equipment.barbell) return true;
-        if (v.equipment.includes('machines') && gym.equipment.machines) return true;
-        return false;
-      }) || def.variations[0];
-
-      return {
-        exerciseId: def.id,
-        variationId: variation.id,
-        sets: [{ id: Math.random().toString(36).substr(2, 9), weight: 0, reps: 0 }]
-      };
-    });
-
-    setCurrentWorkout({
-      id: Math.random().toString(36).substr(2, 9),
-      date: new Date().toISOString(),
-      type: todayWorkoutType,
-      gymId: state.selectedGymId,
-      exercises: initialExercises
-    });
-    setActiveScreen('workout');
-  };
-
-  const completeWorkout = (checkIn: WorkoutLog['checkIn']) => {
-    if (!currentWorkout) return;
-    const completedWorkout = { ...currentWorkout, checkIn };
-    setState(prev => ({
-      ...prev,
-      workoutLogs: [...prev.workoutLogs, completedWorkout]
-    }));
-    setCurrentWorkout(null);
-    setActiveScreen('home');
-  };
-
-  const updateSet = (exerciseIndex: number, setIndex: number, field: 'weight' | 'reps', value: number) => {
-    if (!currentWorkout) return;
-    const newExercises = [...currentWorkout.exercises];
-    newExercises[exerciseIndex].sets[setIndex] = {
-      ...newExercises[exerciseIndex].sets[setIndex],
-      [field]: value
-    };
-    setCurrentWorkout({ ...currentWorkout, exercises: newExercises });
-  };
-
-  const addSet = (exerciseIndex: number) => {
-    if (!currentWorkout) return;
-    const newExercises = [...currentWorkout.exercises];
-    const lastSet = newExercises[exerciseIndex].sets[newExercises[exerciseIndex].sets.length - 1];
-    newExercises[exerciseIndex].sets.push({
-      id: Math.random().toString(36).substr(2, 9),
-      weight: lastSet?.weight || 0,
-      reps: lastSet?.reps || 0
-    });
-    setCurrentWorkout({ ...currentWorkout, exercises: newExercises });
-  };
-
-  const removeSet = (exerciseIndex: number, setIndex: number) => {
-    if (!currentWorkout || currentWorkout.exercises[exerciseIndex].sets.length <= 1) return;
-    const newExercises = [...currentWorkout.exercises];
-    newExercises[exerciseIndex].sets.splice(setIndex, 1);
-    setCurrentWorkout({ ...currentWorkout, exercises: newExercises });
-  };
-
-  const substituteExercise = (exerciseIndex: number, variationId: string) => {
-    if (!currentWorkout) return;
-    const newExercises = [...currentWorkout.exercises];
-    newExercises[exerciseIndex].variationId = variationId;
-    setCurrentWorkout({ ...currentWorkout, exercises: newExercises });
-  };
-
-  const NavItem = ({ screen, icon: Icon, label }: { screen: typeof activeScreen, icon: any, label: string }) => (
-    <button 
-      onClick={() => { setActiveScreen(screen); setIsMenuOpen(false); }}
-      className={cn(
-        "flex items-center gap-3 px-4 py-3 rounded-xl transition-all w-full",
-        activeScreen === screen ? "bg-indigo-50 text-indigo-600" : "text-slate-600 hover:bg-slate-50"
-      )}
-    >
-      <Icon size={20} />
-      <span className="font-medium">{label}</span>
-      {activeScreen === screen && <motion.div layoutId="active-nav" className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-600" />}
-    </button>
-  );
 
   return (
-    <div className="h-screen flex flex-col bg-slate-50 text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-700 overflow-hidden">
-      {/* Mobile Header */}
-      <header className="lg:hidden shrink-0 bg-white border-b border-slate-100 px-4 py-2 flex items-center justify-between z-40">
-        <div className="flex items-center gap-2">
-          <div className="w-7 h-7 bg-indigo-600 rounded-lg flex items-center justify-center text-white">
-            <Zap size={16} fill="currentColor" />
+    <div className="min-h-screen flex items-center justify-center bg-slate-50 p-6">
+      <Card className="max-w-md w-full p-8 shadow-xl">
+        <div className="flex flex-col items-center gap-4 mb-8">
+          <div className="w-16 h-16 bg-indigo-600 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-indigo-100">
+            <Zap size={32} fill="currentColor" />
           </div>
-          <h1 className="font-bold text-base tracking-tight">LiftLog Coach</h1>
+          <h1 className="text-2xl font-bold tracking-tight text-slate-800">LiftLog Coach</h1>
+          <p className="text-slate-500 text-sm font-medium">{isSignUp ? 'Create your account' : 'Sign in to your account'}</p>
         </div>
-        <button onClick={() => setIsMenuOpen(!isMenuOpen)} className="p-2 text-slate-600">
-          {isMenuOpen ? <X size={20} /> : <Menu size={20} />}
-        </button>
-      </header>
 
-      <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar Navigation (Desktop) */}
-        <aside className="hidden lg:flex flex-col w-64 h-full bg-white border-r border-slate-100 p-6 shrink-0">
-          <div className="flex items-center gap-3 mb-10 px-2">
-            <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-indigo-200">
-              <Zap size={22} fill="currentColor" />
-            </div>
-            <h1 className="font-bold text-xl tracking-tight">LiftLog Coach</h1>
-          </div>
+        <form onSubmit={handleAuth} className="flex flex-col gap-4">
+          <Input 
+            label="Email" 
+            type="email" 
+            value={email} 
+            onChange={(e) => setEmail(e.target.value)} 
+            placeholder="you@example.com" 
+            required 
+          />
+          <Input 
+            label="Password" 
+            type="password" 
+            value={password} 
+            onChange={(e) => setPassword(e.target.value)} 
+            placeholder="••••••••" 
+            required 
+          />
           
-          <nav className="flex flex-col gap-2 flex-1">
-            <NavItem screen="home" icon={Home} label="Dashboard" />
-            <NavItem screen="plan" icon={Calendar} label="Training Plan" />
-            <NavItem screen="progress" icon={TrendingUp} label="Progress" />
-            <NavItem screen="gyms" icon={Dumbbell} label="My Gyms" />
-            <NavItem screen="settings" icon={Settings} label="Settings" />
-          </nav>
-
-          <div className="mt-auto p-4 bg-slate-50 rounded-2xl border border-slate-100">
-            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Current Gym</p>
-            <p className="font-bold text-slate-700 truncate">{state.gyms.find(g => g.id === state.selectedGymId)?.name || 'None'}</p>
-          </div>
-        </aside>
-
-        {/* Mobile Menu Overlay */}
-        <AnimatePresence>
-          {isMenuOpen && (
-            <motion.div 
-              initial={{ opacity: 0, y: -20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              className="lg:hidden fixed inset-0 z-30 bg-white p-6 pt-16 flex flex-col gap-2"
-            >
-              <NavItem screen="home" icon={Home} label="Dashboard" />
-              <NavItem screen="plan" icon={Calendar} label="Training Plan" />
-              <NavItem screen="progress" icon={TrendingUp} label="Progress" />
-              <NavItem screen="gyms" icon={Dumbbell} label="My Gyms" />
-              <NavItem screen="settings" icon={Settings} label="Settings" />
-            </motion.div>
+          {error && (
+            <div className="bg-rose-50 text-rose-600 p-3 rounded-lg text-xs font-medium border border-rose-100">
+              {error}
+            </div>
           )}
-        </AnimatePresence>
 
-        {/* Main Content Area */}
-        <main className="flex-1 overflow-y-auto relative">
-          <div className="max-w-4xl mx-auto w-full p-4 lg:p-8 pb-24 lg:pb-8">
-            <AnimatePresence mode="wait">
-              {activeScreen === 'home' && (
-                <motion.div 
-                  key="home"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="flex flex-col gap-4 lg:gap-6"
-                >
-                  <div className="flex flex-col">
-                    <h2 className="text-xl lg:text-2xl font-bold tracking-tight text-slate-800 truncate">Welcome back, Ann</h2>
-                    <p className="text-slate-500 text-xs lg:text-sm font-medium">{format(new Date(), 'EEEE, MMMM do')}</p>
-                  </div>
+          <Button type="submit" disabled={loading} className="mt-2">
+            {loading ? 'Processing...' : (isSignUp ? 'Sign Up' : 'Sign In')}
+          </Button>
+        </form>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 lg:gap-6">
-                    <Card className="bg-indigo-600 text-white border-none shadow-lg shadow-indigo-100 p-4 lg:p-6">
-                      <div className="flex flex-col h-full">
-                        <div className="flex items-center justify-between mb-3 lg:mb-4">
-                          <div className="p-1.5 bg-white/20 rounded-lg">
-                            <Activity size={16} />
-                          </div>
-                          <span className="text-[10px] font-bold uppercase tracking-widest opacity-80">Day {currentDayIndex + 1} of 10</span>
-                        </div>
-                        <h3 className="text-[10px] font-semibold opacity-80 mb-0.5 uppercase tracking-wider">Today's Focus</h3>
-                        <p className="text-2xl lg:text-3xl font-bold mb-4 lg:mb-6">{todayWorkoutType}</p>
-                        
-                        <div className="mt-auto flex flex-col gap-3">
-                          <div className="flex flex-col gap-1">
-                            <label className="text-[10px] font-bold uppercase tracking-widest opacity-70">Select Gym</label>
-                            <select 
-                              value={state.selectedGymId}
-                              onChange={(e) => setState(prev => ({ ...prev, selectedGymId: e.target.value }))}
-                              className="bg-white/10 border border-white/20 rounded-lg px-3 py-1.5 text-sm text-white font-medium focus:outline-none focus:ring-2 focus:ring-white/30"
-                            >
-                              {state.gyms.map(gym => (
-                                <option key={gym.id} value={gym.id} className="text-slate-900">{gym.name}</option>
-                              ))}
-                            </select>
-                          </div>
-                          
-                          {todayWorkoutType !== 'Rest' && todayWorkoutType !== 'Active Recovery' ? (
-                            <Button 
-                              onClick={startWorkout}
-                              className="bg-white text-indigo-600 hover:bg-indigo-50 w-full py-2.5 lg:py-3 text-base lg:text-lg"
-                            >
-                              Start Workout
-                            </Button>
-                          ) : (
-                            <div className="bg-white/10 rounded-lg p-3 text-center">
-                              <p className="text-sm font-medium">Enjoy your {todayWorkoutType.toLowerCase()} day!</p>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </Card>
-
-                    <div className="flex flex-col gap-4 lg:gap-6">
-                      <Card className="p-4 lg:p-6">
-                        <div className="flex items-center justify-between mb-3">
-                          <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
-                            <History size={16} className="text-indigo-500" />
-                            Last Session
-                          </h3>
-                          {lastWorkout && (
-                            <span className="text-[10px] font-medium text-slate-400">
-                              {format(new Date(lastWorkout.date), 'MMM d')}
-                            </span>
-                          )}
-                        </div>
-                        {lastWorkout ? (
-                          <div className="flex flex-col gap-2">
-                            <p className="text-lg lg:text-xl font-bold text-slate-800">{lastWorkout.type}</p>
-                            <div className="flex items-center gap-3 text-xs text-slate-500">
-                              <span className="flex items-center gap-1"><Zap size={12} /> {lastWorkout.exercises.length}</span>
-                              <span className="flex items-center gap-1 truncate"><Dumbbell size={12} /> {state.gyms.find(g => g.id === lastWorkout.gymId)?.name}</span>
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="py-4 text-center">
-                            <p className="text-slate-400 text-xs">No workouts logged yet.</p>
-                          </div>
-                        )}
-                      </Card>
-
-                      <Card className="bg-slate-800 text-white border-none p-4 lg:p-6">
-                        <div className="flex items-center justify-between mb-3">
-                          <h3 className="font-bold text-sm flex items-center gap-2">
-                            <TrendingUp size={16} className="text-emerald-400" />
-                            Stats
-                          </h3>
-                        </div>
-                        <div className="grid grid-cols-2 gap-4">
-                          <div className="flex flex-col">
-                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Total</span>
-                            <span className="text-xl font-bold">{state.workoutLogs.length}</span>
-                          </div>
-                          <div className="flex flex-col">
-                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Streak</span>
-                            <span className="text-xl font-bold">3d</span>
-                          </div>
-                        </div>
-                      </Card>
-                    </div>
-                  </div>
-                </motion.div>
-              )}
-
-              {activeScreen === 'workout' && currentWorkout && (
-                <motion.div 
-                  key="workout"
-                  initial={{ opacity: 0, x: 10 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  exit={{ opacity: 0, x: -10 }}
-                  className="flex flex-col gap-4 lg:gap-6"
-                >
-                  <div className="flex items-center justify-between shrink-0">
-                    <div className="flex flex-col">
-                      <h2 className="text-xl lg:text-2xl font-bold text-slate-800">{currentWorkout.type}</h2>
-                      <p className="text-slate-500 text-xs font-medium">Tracking session</p>
-                    </div>
-                    <Button variant="outline" onClick={() => { if(confirm('Cancel workout?')) { setCurrentWorkout(null); setActiveScreen('home'); } }} className="px-3 py-1.5 text-xs">
-                      Cancel
-                    </Button>
-                  </div>
-
-                  <div className="flex flex-col gap-4 lg:gap-6">
-                    {currentWorkout.exercises.map((exLog, exIdx) => {
-                      const def = EXERCISES[currentWorkout.type].find(d => d.id === exLog.exerciseId);
-                      const variation = def?.variations.find(v => v.id === exLog.variationId);
-                      const lastPerf = getLastPerformance(exLog.exerciseId);
-                      const bestWeight = getBestPerformance(exLog.exerciseId);
-
-                      return (
-                        <Card key={exLog.exerciseId} className="p-0 overflow-hidden border-slate-200">
-                          <div className="px-4 py-3 bg-slate-50 border-b border-slate-100 flex items-center justify-between gap-2">
-                            <div className="flex flex-col min-w-0">
-                              <h3 className="font-bold text-slate-800 text-sm lg:text-base truncate">{variation?.name}</h3>
-                              <div className="flex items-center gap-2 mt-0.5">
-                                {lastPerf && <span className="text-[10px] font-medium text-slate-500 whitespace-nowrap">Last: {lastPerf.weight}kg×{lastPerf.reps}</span>}
-                                {bestWeight > 0 && <span className="text-[10px] font-bold text-emerald-600 whitespace-nowrap">Best: {bestWeight}kg</span>}
-                              </div>
-                            </div>
-                            <select 
-                              value={exLog.variationId}
-                              onChange={(e) => substituteExercise(exIdx, e.target.value)}
-                              className="text-[10px] font-bold bg-white border border-slate-200 rounded-lg px-2 py-1 text-indigo-600 focus:outline-none shrink-0"
-                            >
-                              {def?.variations.map(v => (
-                                <option key={v.id} value={v.id}>{v.name}</option>
-                              ))}
-                            </select>
-                          </div>
-
-                          <div className="p-3 lg:p-4 flex flex-col gap-3">
-                            <div className="flex flex-nowrap overflow-x-auto gap-3 pb-2 scrollbar-hide">
-                              {exLog.sets.map((set, setIdx) => (
-                                <motion.div 
-                                  layout
-                                  key={set.id} 
-                                  className="flex flex-col gap-1.5 min-w-[80px] shrink-0 bg-slate-50 p-2 rounded-xl border border-slate-100 relative group"
-                                >
-                                  <div className="flex items-center justify-between">
-                                    <span className="text-[10px] font-bold text-slate-400 uppercase">Set {setIdx + 1}</span>
-                                    {exLog.sets.length > 1 && (
-                                      <button 
-                                        onClick={() => removeSet(exIdx, setIdx)}
-                                        className="text-slate-300 hover:text-rose-500 transition-colors"
-                                      >
-                                        <X size={12} />
-                                      </button>
-                                    )}
-                                  </div>
-                                  <div className="flex flex-col gap-1">
-                                    <div className="flex items-center gap-1">
-                                      <input 
-                                        type="number"
-                                        value={set.weight || ''}
-                                        onChange={(e) => updateSet(exIdx, setIdx, 'weight', parseFloat(e.target.value) || 0)}
-                                        className="w-full bg-white border border-slate-200 rounded-lg px-1.5 py-1 text-xs text-center font-bold focus:ring-2 focus:ring-indigo-500/20"
-                                        placeholder="kg"
-                                      />
-                                      <span className="text-[10px] font-bold text-slate-400">kg</span>
-                                    </div>
-                                    <div className="flex items-center gap-1">
-                                      <input 
-                                        type="number"
-                                        value={set.reps || ''}
-                                        onChange={(e) => updateSet(exIdx, setIdx, 'reps', parseInt(e.target.value) || 0)}
-                                        className="w-full bg-white border border-slate-200 rounded-lg px-1.5 py-1 text-xs text-center font-bold focus:ring-2 focus:ring-indigo-500/20"
-                                        placeholder="reps"
-                                      />
-                                      <span className="text-[10px] font-bold text-slate-400">reps</span>
-                                    </div>
-                                  </div>
-                                </motion.div>
-                              ))}
-                              <button 
-                                onClick={() => addSet(exIdx)}
-                                className="flex flex-col items-center justify-center gap-1 min-w-[80px] shrink-0 border-2 border-dashed border-slate-200 rounded-xl text-slate-400 hover:text-indigo-600 hover:border-indigo-200 transition-all"
-                              >
-                                <Plus size={16} />
-                                <span className="text-[10px] font-bold uppercase">Add</span>
-                              </button>
-                            </div>
-                          </div>
-                        </Card>
-                      );
-                    })}
-                  </div>
-
-                  {/* Sticky Bottom Action */}
-                  <div className="fixed bottom-0 left-0 right-0 lg:absolute lg:bottom-0 p-4 bg-white/80 backdrop-blur-md border-t border-slate-100 lg:bg-transparent lg:border-none lg:p-0 lg:static">
-                    <Button 
-                      onClick={() => setActiveScreen('settings')} 
-                      className="w-full py-3.5 text-lg lg:mt-6"
-                    >
-                      Complete Workout
-                    </Button>
-                  </div>
-
-                  <CheckInModal 
-                    isOpen={activeScreen === 'settings' && !!currentWorkout} 
-                    onClose={() => setActiveScreen('workout')}
-                    onComplete={completeWorkout}
-                  />
-                </motion.div>
-              )}
-
-              {activeScreen === 'progress' && (
-                <motion.div 
-                  key="progress"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="flex flex-col gap-4 lg:gap-6"
-                >
-                  <div className="flex flex-col">
-                    <h2 className="text-xl lg:text-2xl font-bold tracking-tight text-slate-800">Progress Tracking</h2>
-                    <p className="text-slate-500 text-xs font-medium">Visualizing your gains over time</p>
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-3 lg:gap-4">
-                    <Card className="flex flex-col items-center justify-center py-4 lg:py-6">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Workouts</span>
-                      <span className="text-xl lg:text-2xl font-black text-indigo-600">{state.workoutLogs.length}</span>
-                    </Card>
-                    <Card className="flex flex-col items-center justify-center py-4 lg:py-6">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Avg Energy</span>
-                      <span className="text-xl lg:text-2xl font-black text-amber-500">
-                        {state.workoutLogs.length > 0 
-                          ? (state.workoutLogs.reduce((acc, log) => acc + (log.checkIn?.energy || 0), 0) / state.workoutLogs.length).toFixed(1)
-                          : '0.0'}
-                      </span>
-                    </Card>
-                    <Card className="flex flex-col items-center justify-center py-4 lg:py-6">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Consistency</span>
-                      <span className="text-xl lg:text-2xl font-black text-emerald-500">85%</span>
-                    </Card>
-                  </div>
-
-                  <Card className="p-4 lg:p-6">
-                    <h3 className="font-bold text-slate-800 text-sm mb-4 lg:mb-6 flex items-center gap-2">
-                      <BarChart3 size={16} className="text-indigo-500" />
-                      Volume Over Time
-                    </h3>
-                    <div className="h-[200px] lg:h-[300px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={state.workoutLogs.map(log => ({
-                          date: format(new Date(log.date), 'MMM d'),
-                          volume: log.exercises.reduce((acc, ex) => acc + ex.sets.reduce((sAcc, s) => sAcc + (s.weight * s.reps), 0), 0)
-                        }))}>
-                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                          <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} />
-                          <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} />
-                          <Tooltip 
-                            contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)', fontSize: '12px' }}
-                          />
-                          <Line 
-                            type="monotone" 
-                            dataKey="volume" 
-                            stroke="#4f46e5" 
-                            strokeWidth={2} 
-                            dot={{ r: 3, fill: '#4f46e5', strokeWidth: 1, stroke: '#fff' }}
-                            activeDot={{ r: 5, strokeWidth: 0 }}
-                          />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </Card>
-
-                  <div className="flex flex-col gap-3">
-                    <h3 className="font-bold text-slate-800 text-sm">Exercise History</h3>
-                    <div className="flex flex-col gap-2">
-                      {state.workoutLogs.slice().reverse().map(log => (
-                        <div key={log.id} className="bg-white p-3 rounded-xl border border-slate-100 flex items-center justify-between">
-                          <div className="flex flex-col min-w-0">
-                            <span className="text-sm font-bold text-slate-800 truncate">{log.type}</span>
-                            <span className="text-[10px] text-slate-400">{format(new Date(log.date), 'MMM do, yyyy')}</span>
-                          </div>
-                          <div className="flex items-center gap-3 shrink-0">
-                            <div className="flex flex-col items-end">
-                              <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-widest">Difficulty</span>
-                              <span className="text-xs font-medium capitalize">{log.checkIn?.difficulty || 'N/A'}</span>
-                            </div>
-                            <ChevronRight size={16} className="text-slate-300" />
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </motion.div>
-              )}
-
-              {activeScreen === 'plan' && (
-                <motion.div 
-                  key="plan"
-                  initial={{ opacity: 0, scale: 0.98 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  exit={{ opacity: 0, scale: 0.98 }}
-                  className="flex flex-col gap-4 lg:gap-6"
-                >
-                  <div className="flex flex-col">
-                    <h2 className="text-xl lg:text-2xl font-bold tracking-tight text-slate-800">Training Plan</h2>
-                    <p className="text-slate-500 text-xs font-medium">Your 10-day rotation cycle</p>
-                  </div>
-
-                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 lg:gap-4">
-                    {TEN_DAY_PLAN.map((type, idx) => {
-                      const isToday = idx === currentDayIndex;
-                      const date = addDays(new Date(state.startDate), idx + (Math.floor(differenceInDays(new Date(), new Date(state.startDate)) / 10) * 10));
-                      
-                      return (
-                        <div 
-                          key={idx}
-                          className={cn(
-                            "relative p-3 lg:p-4 rounded-xl border-2 transition-all flex flex-col justify-between min-h-[100px]",
-                            isToday 
-                              ? "bg-indigo-600 border-indigo-600 text-white shadow-lg shadow-indigo-100 z-10" 
-                              : "bg-white border-slate-100 text-slate-800"
-                          )}
-                        >
-                          <div className="flex justify-between items-start mb-2">
-                            <span className={cn(
-                              "text-[10px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded",
-                              isToday ? "bg-white/20" : "bg-slate-100 text-slate-500"
-                            )}>
-                              Day {idx + 1}
-                            </span>
-                            {isToday && <div className="bg-white text-indigo-600 text-[8px] font-black px-1.5 py-0.5 rounded-full uppercase">Today</div>}
-                          </div>
-                          <div>
-                            <h3 className="text-sm font-bold leading-tight mb-1">{type}</h3>
-                            <p className={cn("text-[10px] font-medium", isToday ? "text-indigo-100" : "text-slate-400")}>
-                              {format(date, 'EEE, MMM do')}
-                            </p>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  <Card className="bg-amber-50 border-amber-100 p-4">
-                    <div className="flex gap-3">
-                      <div className="w-10 h-10 rounded-lg bg-amber-100 flex items-center justify-center text-amber-600 shrink-0">
-                        <Calendar size={20} />
-                      </div>
-                      <div>
-                        <h4 className="font-bold text-amber-900 text-sm">Plan Reset</h4>
-                        <p className="text-xs text-amber-800/70 mt-1">
-                          Cycle started on {format(new Date(state.startDate), 'MMMM do')}. 
-                          Reset the start date in settings to restart from Day 1.
-                        </p>
-                      </div>
-                    </div>
-                  </Card>
-                </motion.div>
-              )}
-
-              {activeScreen === 'gyms' && (
-                <motion.div 
-                  key="gyms"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="flex flex-col gap-4 lg:gap-6"
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex flex-col">
-                      <h2 className="text-xl lg:text-2xl font-bold tracking-tight text-slate-800">My Gyms</h2>
-                      <p className="text-slate-500 text-xs font-medium">Manage locations</p>
-                    </div>
-                    <Button onClick={() => {
-                      const newGym: Gym = {
-                        id: Math.random().toString(36).substr(2, 9),
-                        name: 'New Gym',
-                        equipment: { dumbbells: true, barbell: false, machines: false }
-                      };
-                      setState(prev => ({ ...prev, gyms: [...prev.gyms, newGym] }));
-                    }} className="flex items-center gap-2 px-3 py-1.5 text-xs">
-                      <Plus size={16} /> Add Gym
-                    </Button>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 lg:gap-6">
-                    {state.gyms.map(gym => (
-                      <Card key={gym.id} className="flex flex-col gap-4 p-4 lg:p-6">
-                        <div className="flex items-center justify-between">
-                          <Input 
-                            value={gym.name}
-                            onChange={(e) => {
-                              const newGyms = state.gyms.map(g => g.id === gym.id ? { ...g, name: e.target.value } : g);
-                              setState(prev => ({ ...prev, gyms: newGyms }));
-                            }}
-                            className="flex-1 mr-3 h-9 text-sm"
-                          />
-                          <button 
-                            onClick={() => {
-                              if (state.gyms.length <= 1) return;
-                              setState(prev => ({ ...prev, gyms: prev.gyms.filter(g => g.id !== gym.id) }));
-                            }}
-                            className="p-2 text-slate-300 hover:text-rose-500 transition-colors"
-                          >
-                            <Trash2 size={18} />
-                          </button>
-                        </div>
-
-                        <div className="flex flex-col gap-2">
-                          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Available Equipment</p>
-                          <div className="grid grid-cols-1 gap-1.5">
-                            {(['dumbbells', 'barbell', 'machines'] as const).map(item => (
-                              <label key={item} className="flex items-center justify-between p-2.5 bg-slate-50 rounded-lg cursor-pointer hover:bg-slate-100 transition-colors">
-                                <span className="text-sm font-medium text-slate-700 capitalize">{item}</span>
-                                <input 
-                                  type="checkbox"
-                                  checked={gym.equipment[item]}
-                                  onChange={(e) => {
-                                    const newGyms = state.gyms.map(g => g.id === gym.id ? { 
-                                      ...g, 
-                                      equipment: { ...g.equipment, [item]: e.target.checked } 
-                                    } : g);
-                                    setState(prev => ({ ...prev, gyms: newGyms }));
-                                  }}
-                                  className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                                />
-                              </label>
-                            ))}
-                          </div>
-                        </div>
-                      </Card>
-                    ))}
-                  </div>
-                </motion.div>
-              )}
-
-              {activeScreen === 'settings' && !currentWorkout && (
-                <motion.div 
-                  key="settings"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="flex flex-col gap-4 lg:gap-6"
-                >
-                  <div className="flex flex-col">
-                    <h2 className="text-xl lg:text-2xl font-bold tracking-tight text-slate-800">Settings</h2>
-                    <p className="text-slate-500 text-xs font-medium">App configuration</p>
-                  </div>
-
-                  <Card className="flex flex-col gap-4 p-4 lg:p-6">
-                    <h3 className="font-bold text-slate-800 text-sm">Plan Configuration</h3>
-                    <div className="flex flex-col gap-3">
-                      <div className="flex flex-col gap-1.5">
-                        <label className="text-xs font-medium text-slate-500">Cycle Start Date</label>
-                        <input 
-                          type="date"
-                          value={format(new Date(state.startDate), 'yyyy-MM-dd')}
-                          onChange={(e) => setState(prev => ({ ...prev, startDate: new Date(e.target.value).toISOString() }))}
-                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-                        />
-                        <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">This date determines which day of the 10-day plan you are on today.</p>
-                      </div>
-                    </div>
-                  </Card>
-
-                  <Card className="border-rose-100 bg-rose-50/30 p-4 lg:p-6">
-                    <h3 className="font-bold text-rose-800 text-sm mb-2">Danger Zone</h3>
-                    <p className="text-xs text-rose-700/70 mb-4">Deleting your data is permanent. Please be certain.</p>
-                    <Button 
-                      variant="danger" 
-                      onClick={() => {
-                        if (confirm('Are you absolutely sure? This will delete all your workout history.')) {
-                          localStorage.removeItem(STORAGE_KEY);
-                          window.location.reload();
-                        }
-                      }}
-                      className="w-full sm:w-auto py-2 text-sm"
-                    >
-                      Clear All Data
-                    </Button>
-                  </Card>
-
-                  <div className="text-center py-6">
-                    <p className="text-slate-400 text-[10px] font-medium uppercase tracking-widest">LiftLog Coach v1.0.0</p>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
-        </main>
-      </div>
-
-      {/* Mobile Bottom Navigation */}
-      <nav className="lg:hidden shrink-0 bg-white border-t border-slate-100 px-6 py-2 flex items-center justify-between z-40">
-        <NavIconButton active={activeScreen === 'home'} onClick={() => setActiveScreen('home')} icon={Home} />
-        <NavIconButton active={activeScreen === 'plan'} onClick={() => setActiveScreen('plan')} icon={Calendar} />
-        <NavIconButton active={activeScreen === 'progress'} onClick={() => setActiveScreen('progress')} icon={TrendingUp} />
-        <NavIconButton active={activeScreen === 'gyms'} onClick={() => setActiveScreen('gyms')} icon={Dumbbell} />
-        <NavIconButton active={activeScreen === 'settings'} onClick={() => setActiveScreen('settings')} icon={Settings} />
-      </nav>
+        <div className="mt-6 text-center">
+          <button 
+            onClick={() => setIsSignUp(!isSignUp)}
+            className="text-sm font-semibold text-indigo-600 hover:text-indigo-700"
+          >
+            {isSignUp ? 'Already have an account? Sign In' : "Don't have an account? Sign Up"}
+          </button>
+        </div>
+      </Card>
     </div>
   );
 }
 
-function NavIconButton({ active, onClick, icon: Icon }: { active: boolean, onClick: () => void, icon: any }) {
+// --- Main App Component ---
+
+export default function App() {
+  const [userId, setUserId] = useState<string | null>(null);
+  const [activeScreen, setActiveScreen] = useState<'home' | 'calendar' | 'workout' | 'progress' | 'settings'>('home');
+  const [loading, setLoading] = useState(true);
+  const [workoutDetail, setWorkoutDetail] = useState<any>(null);
+  const [selectedDate, setSelectedDate] = useState<Date>(new Date());
+  const [isDayDetailOpen, setIsDayDetailOpen] = useState(false);
+  const [isEditMode, setIsEditMode] = useState(false);
+  const [currentSession, setCurrentSession] = useState<WorkoutSession | null>(null);
+  const [activeExerciseLogs, setActiveExerciseLogs] = useState<any[]>([]);
+  const [allSessions, setAllSessions] = useState<any[]>([]);
+  const [upcomingWorkouts, setUpcomingWorkouts] = useState<any[]>([]);
+  const [bestPerformances, setBestPerformances] = useState<Record<string, any>>({});
+
+  useEffect(() => {
+    checkUser();
+  }, []);
+
+  const checkUser = async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      setUserId(user.id);
+      fetchInitialData(user.id);
+    } else {
+      setLoading(false);
+    }
+  };
+
+  const fetchInitialData = async (uid: string) => {
+    setLoading(true);
+    try {
+      const detail = await getWorkoutDetailForDate(new Date(), uid);
+      setWorkoutDetail(detail);
+
+      // Fetch upcoming workouts (next 4 days)
+      const upcoming = [];
+      for (let i = 1; i <= 4; i++) {
+        const futureDate = addDays(new Date(), i);
+        const futureDetail = await getWorkoutDetailForDate(futureDate, uid);
+        if (futureDetail) {
+          upcoming.push(futureDetail);
+        }
+      }
+      setUpcomingWorkouts(upcoming);
+
+      const { data: sessions } = await supabase
+        .from('workout_sessions')
+        .select('*, workout_days(*), check_ins(*)')
+        .eq('user_id', uid)
+        .eq('completed', true)
+        .order('session_date', { ascending: false });
+      
+      setAllSessions(sessions || []);
+
+      // Fetch best performances
+      const { data: bestSets } = await supabase
+        .from('set_logs')
+        .select('*, exercise_logs(programmed_exercise_name, session_id)')
+        .order('weight', { ascending: false });
+      
+      const bests: Record<string, any> = {};
+      bestSets?.forEach((set: any) => {
+        const name = set.exercise_logs.programmed_exercise_name;
+        if (!bests[name] || set.weight > bests[name].weight) {
+          bests[name] = set;
+        }
+      });
+      setBestPerformances(bests);
+
+    } catch (err) {
+      console.error('Error fetching data:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setUserId(null);
+    setActiveScreen('home');
+  };
+
+  const loadWorkoutForDate = async (date: Date) => {
+    if (!userId) return;
+    setLoading(true);
+    try {
+      const detail = await getWorkoutDetailForDate(date, userId);
+      setWorkoutDetail(detail);
+    } catch (err) {
+      console.error('Error loading workout:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const startWorkout = async (detail: any) => {
+    if (!userId || detail.is_rest_day) return;
+
+    setLoading(true);
+    try {
+      const { data: session, error } = await supabase
+        .from('workout_sessions')
+        .insert({
+          user_id: userId,
+          workout_day_id: detail.workout_day_id,
+          session_date: detail.workout_date,
+          gym_name: 'Main Gym',
+          completed: false
+        })
+        .select()
+        .single();
+
+      if (session) {
+        setCurrentSession(session);
+        const logs = detail.exercises.map((ex: any, idx: number) => ({
+          programmed_exercise_name: ex.exercise_name,
+          performed_exercise_name: ex.exercise_name,
+          sequence_order: idx,
+          target_sets: ex.target_sets,
+          target_reps: ex.target_reps,
+          sets: Array.from({ length: ex.target_sets }).map((_, sIdx) => ({
+            set_number: sIdx + 1,
+            weight: 0,
+            reps: parseInt(ex.target_reps) || 0,
+            notes: ''
+          }))
+        }));
+        setActiveExerciseLogs(logs);
+        setActiveScreen('workout');
+        setIsDayDetailOpen(false);
+      }
+    } catch (err) {
+      console.error('Error starting workout:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const markRestDay = async (date: Date) => {
+    if (!userId) return;
+    const dateKey = formatLocalYYYYMMDD(date);
+    await supabase.from('workout_day_overrides').upsert({
+      user_id: userId,
+      date: dateKey,
+      is_rest_day: true,
+      custom_day_name: 'Rest Day'
+    }, { onConflict: 'user_id,date' });
+    loadWorkoutForDate(date);
+  };
+
+  const restorePlan = async (date: Date) => {
+    if (!userId) return;
+    const dateKey = formatLocalYYYYMMDD(date);
+    await supabase.from('workout_day_overrides').delete().eq('date', dateKey).eq('user_id', userId);
+    await supabase.from('workout_exercise_overrides').delete().eq('date', dateKey).eq('user_id', userId);
+    loadWorkoutForDate(date);
+  };
+
+  const saveExerciseOverrides = async (date: Date, exercises: any[]) => {
+    if (!userId) return;
+    const dateKey = formatLocalYYYYMMDD(date);
+    setLoading(true);
+    try {
+      // 1. Delete ALL existing exercise overrides for this date
+      await supabase.from('workout_exercise_overrides').delete().eq('date', dateKey).eq('user_id', userId);
+      
+      // 2. Insert the new set of exercises as overrides
+      const overrides = exercises.map((ex, idx) => ({
+        user_id: userId,
+        date: dateKey,
+        exercise_name: ex.exercise_name,
+        target_sets: ex.target_sets,
+        target_reps: ex.target_reps,
+        sequence_order: idx,
+        notes: ex.notes || ''
+      }));
+
+      if (overrides.length > 0) {
+        const { error } = await supabase.from('workout_exercise_overrides').insert(overrides);
+        if (error) throw error;
+      }
+
+      // 3. Ensure is_rest_day is false if we have exercises
+      await supabase.from('workout_day_overrides').upsert({
+        user_id: userId,
+        date: dateKey,
+        is_rest_day: false
+      }, { onConflict: 'user_id,date' });
+
+      setIsEditMode(false);
+      await loadWorkoutForDate(date);
+    } catch (err) {
+      console.error('Error saving overrides:', err);
+      alert('Failed to save changes. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const completeWorkout = async () => {
+    if (!currentSession || !userId) return;
+    setLoading(true);
+    try {
+      for (const exLog of activeExerciseLogs) {
+        const { data: savedExLog } = await supabase
+          .from('exercise_logs')
+          .insert({
+            session_id: currentSession.id,
+            programmed_exercise_name: exLog.programmed_exercise_name,
+            performed_exercise_name: exLog.performed_exercise_name,
+            sequence_order: exLog.sequence_order
+          })
+          .select()
+          .single();
+
+        if (savedExLog) {
+          const setLogs = exLog.sets.map((s: any) => ({
+            exercise_log_id: savedExLog.id,
+            set_number: s.set_number,
+            weight: s.weight,
+            reps: s.reps,
+            notes: s.notes
+          }));
+          await supabase.from('set_logs').insert(setLogs);
+        }
+      }
+
+      await supabase
+        .from('workout_sessions')
+        .update({ completed: true })
+        .eq('id', currentSession.id);
+
+      setCurrentSession(null);
+      setActiveExerciseLogs([]);
+      setActiveScreen('home');
+      fetchInitialData(userId);
+    } catch (err) {
+      console.error('Error completing workout:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!userId) {
+    return <Auth onAuthSuccess={(id) => { setUserId(id); fetchInitialData(id); }} />;
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col font-sans text-slate-900 selection:bg-indigo-100 selection:text-indigo-700">
+      {/* Header */}
+      <header className="sticky top-0 z-40 bg-white/80 backdrop-blur-md border-b border-slate-100 px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-indigo-100">
+            <Zap size={18} fill="currentColor" />
+          </div>
+          <h1 className="font-bold text-xl tracking-tight hidden sm:block">LiftLog Coach</h1>
+        </div>
+        
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={() => setActiveScreen('settings')}
+            className="p-2 text-slate-500 hover:bg-slate-100 rounded-lg transition-colors"
+          >
+            <Settings size={20} />
+          </button>
+          <button 
+            onClick={handleSignOut}
+            className="p-2 text-slate-500 hover:bg-rose-50 hover:text-rose-600 rounded-lg transition-colors"
+          >
+            <LogOut size={20} />
+          </button>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 overflow-y-auto p-4 sm:p-6 max-w-5xl mx-auto w-full pb-24 sm:pb-6">
+        <AnimatePresence mode="wait">
+          {activeScreen === 'home' && (
+            <motion.div 
+              key="home"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="flex flex-col gap-6"
+            >
+              <div className="flex flex-col">
+                <h2 className="text-2xl font-bold tracking-tight text-slate-800">Dashboard</h2>
+                <p className="text-slate-500 text-sm font-medium">{format(new Date(), 'EEEE, MMMM do')}</p>
+              </div>
+
+              {/* Today's Plan Card */}
+              <Card className="bg-indigo-600 text-white border-none shadow-xl shadow-indigo-100 relative overflow-hidden group">
+                <div className="absolute top-0 right-0 p-8 opacity-10 transform translate-x-4 -translate-y-4 group-hover:scale-110 transition-transform">
+                  <Dumbbell size={120} />
+                </div>
+                
+                <div className="relative z-10 flex flex-col gap-4">
+                  <div className="flex items-center gap-2 text-indigo-100 text-xs font-bold uppercase tracking-widest">
+                    <Activity size={14} />
+                    Today's Plan
+                  </div>
+                  
+                  <div className="flex flex-col">
+                    <h3 className="text-3xl font-bold flex items-center gap-2">
+                      {loading ? 'Loading...' : (workoutDetail?.workout_day_name || 'Rest Day')}
+                      {workoutDetail?.is_error && <AlertCircle size={24} className="text-rose-300" />}
+                    </h3>
+                    {workoutDetail?.workout_day_category && (
+                      <p className="text-indigo-100 text-xs font-bold uppercase tracking-wider mt-0.5">
+                        {workoutDetail.workout_day_category}
+                      </p>
+                    )}
+                    {!workoutDetail?.is_rest_day && (
+                      <p className="text-indigo-100 text-sm font-medium mt-1">
+                        {workoutDetail?.exercises?.length || 0} exercises scheduled
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap gap-3 mt-2">
+                    {!workoutDetail?.is_rest_day ? (
+                      <>
+                        <Button 
+                          onClick={() => startWorkout(workoutDetail)}
+                          className="bg-white text-indigo-600 hover:bg-indigo-50 border-none px-8"
+                        >
+                          <Play size={18} fill="currentColor" />
+                          Start Workout
+                        </Button>
+                        <Button 
+                          variant="outline" 
+                          onClick={() => { setSelectedDate(new Date()); setIsDayDetailOpen(true); }}
+                          className="border-white/30 text-white hover:bg-white/10"
+                        >
+                          View Details
+                        </Button>
+                      </>
+                    ) : (
+                      <Button 
+                        variant="outline" 
+                        onClick={() => { setSelectedDate(new Date()); setIsDayDetailOpen(true); }}
+                        className="border-white/30 text-white hover:bg-white/10"
+                      >
+                        Manage Plan
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </Card>
+
+              {/* Upcoming Workouts */}
+              <div className="flex flex-col gap-4">
+                <div className="flex items-center justify-between">
+                  <h4 className="font-bold text-slate-800 flex items-center gap-2">
+                    <Calendar size={18} className="text-indigo-600" />
+                    Upcoming Workouts
+                  </h4>
+                  <button onClick={() => setActiveScreen('calendar')} className="text-xs font-bold text-indigo-600 uppercase tracking-wider">Full Calendar</button>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  {upcomingWorkouts.map((workout, idx) => (
+                    <button 
+                      key={idx}
+                      onClick={() => {
+                        setSelectedDate(parseISO(workout.workout_date));
+                        setWorkoutDetail(workout);
+                        setIsDayDetailOpen(true);
+                      }}
+                      className="flex flex-col gap-2 p-3 bg-white border border-slate-100 rounded-2xl hover:border-indigo-200 hover:shadow-sm transition-all text-left group"
+                    >
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                        {format(parseISO(workout.workout_date), 'EEE, MMM do')}
+                      </span>
+                      <span className={cn(
+                        "text-sm font-bold truncate group-hover:text-indigo-600 transition-colors",
+                        workout.is_error ? "text-rose-500" : workout.is_rest_day ? "text-slate-400" : "text-slate-700"
+                      )}>
+                        {workout.workout_day_name}
+                      </span>
+                      {!workout.is_rest_day && (
+                        <span className="text-[9px] font-medium text-slate-400">
+                          {workout.exercises.length} exercises
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Recent Summary */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <Card className="flex flex-col gap-4">
+                  <div className="flex items-center justify-between">
+                    <h4 className="font-bold text-slate-800 flex items-center gap-2">
+                      <History size={18} className="text-indigo-600" />
+                      Recent Session
+                    </h4>
+                    <button onClick={() => setActiveScreen('progress')} className="text-xs font-bold text-indigo-600 uppercase tracking-wider">View All</button>
+                  </div>
+                  
+                  {allSessions.length > 0 ? (
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-100">
+                        <div className="flex flex-col">
+                          <span className="text-sm font-bold text-slate-700">{allSessions[0].workout_days?.name || 'Workout'}</span>
+                          <span className="text-[10px] font-medium text-slate-400">{format(parseISO(allSessions[0].session_date), 'MMM do, yyyy')}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {allSessions[0].check_ins?.[0] && (
+                            <span className={cn(
+                              "text-[10px] font-bold px-2 py-0.5 rounded uppercase",
+                              allSessions[0].check_ins[0].difficulty === 'hard' ? "bg-rose-100 text-rose-600" :
+                              allSessions[0].check_ins[0].difficulty === 'medium' ? "bg-amber-100 text-amber-600" :
+                              "bg-emerald-100 text-emerald-600"
+                            )}>
+                              {allSessions[0].check_ins[0].difficulty}
+                            </span>
+                          )}
+                          <ChevronRight size={16} className="text-slate-300" />
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-slate-400 italic py-4 text-center">No sessions logged yet.</p>
+                  )}
+                </Card>
+
+                <Card className="flex flex-col gap-4">
+                  <h4 className="font-bold text-slate-800 flex items-center gap-2">
+                    <TrendingUp size={18} className="text-indigo-600" />
+                    Quick Stats
+                  </h4>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex flex-col">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Total Workouts</span>
+                      <span className="text-2xl font-black text-slate-800">{allSessions.length}</span>
+                    </div>
+                    <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex flex-col">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Active Streak</span>
+                      <span className="text-2xl font-black text-slate-800">3 days</span>
+                    </div>
+                  </div>
+                </Card>
+              </div>
+            </motion.div>
+          )}
+
+          {activeScreen === 'calendar' && (
+            <motion.div 
+              key="calendar"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.98 }}
+              className="flex flex-col gap-6"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <button 
+                    onClick={() => setActiveScreen('home')}
+                    className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-600"
+                  >
+                    <ArrowLeft size={20} />
+                  </button>
+                  <div className="flex flex-col">
+                    <h2 className="text-2xl font-bold tracking-tight text-slate-800">Calendar</h2>
+                    <p className="text-slate-500 text-sm font-medium">Manage your training schedule</p>
+                  </div>
+                </div>
+              </div>
+
+              <Card className="p-4">
+                <CalendarView 
+                  userId={userId}
+                  onDateSelect={(date) => {
+                    setSelectedDate(date);
+                    loadWorkoutForDate(date);
+                    setIsDayDetailOpen(true);
+                  }}
+                />
+              </Card>
+            </motion.div>
+          )}
+
+          {activeScreen === 'progress' && (
+            <motion.div 
+              key="progress"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="flex flex-col gap-6"
+            >
+              <div className="flex flex-col">
+                <h2 className="text-2xl font-bold tracking-tight text-slate-800">Progress</h2>
+                <p className="text-slate-500 text-sm font-medium">Your fitness journey in data</p>
+              </div>
+
+              <div className="grid grid-cols-1 gap-6">
+                <Card className="p-6">
+                  <h4 className="font-bold text-slate-800 mb-6">Workout Frequency</h4>
+                  <div className="h-64 w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={allSessions.slice(0, 7).reverse().map(s => ({ date: format(parseISO(s.session_date), 'MM/dd'), count: 1 }))}>
+                        <defs>
+                          <linearGradient id="colorCount" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#4f46e5" stopOpacity={0.1}/>
+                            <stop offset="95%" stopColor="#4f46e5" stopOpacity={0}/>
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                        <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+                        <YAxis hide />
+                        <Tooltip />
+                        <Area type="monotone" dataKey="count" stroke="#4f46e5" strokeWidth={3} fillOpacity={1} fill="url(#colorCount)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </Card>
+
+                <Card className="p-6">
+                  <h4 className="font-bold text-slate-800 mb-4">Best Performances</h4>
+                  <div className="flex flex-col gap-3">
+                    {Object.entries(bestPerformances).map(([name, set]: [string, any]) => (
+                      <div key={name} className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <div className="flex flex-col">
+                          <span className="text-sm font-bold text-slate-700">{name}</span>
+                          <span className="text-[10px] font-medium text-slate-400 uppercase tracking-wider">Personal Best</span>
+                        </div>
+                        <div className="flex flex-col items-end">
+                          <span className="text-lg font-black text-indigo-600">{set.weight} lb</span>
+                          <span className="text-[10px] font-bold text-slate-400">{set.reps} reps</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </Card>
+
+                <Card className="p-6">
+                  <h4 className="font-bold text-slate-800 mb-4">Session History</h4>
+                  <div className="flex flex-col gap-3">
+                    {allSessions.map((session) => (
+                      <div key={session.id} className="flex items-center justify-between p-4 bg-white border border-slate-100 rounded-2xl hover:border-indigo-100 transition-colors cursor-pointer group">
+                        <div className="flex items-center gap-4">
+                          <div className="w-10 h-10 bg-slate-50 rounded-xl flex items-center justify-center text-slate-400 group-hover:bg-indigo-50 group-hover:text-indigo-600 transition-colors">
+                            <History size={20} />
+                          </div>
+                          <div className="flex flex-col">
+                            <span className="text-sm font-bold text-slate-700">{session.workout_days?.name || 'Workout'}</span>
+                            <span className="text-[10px] font-medium text-slate-400">{format(parseISO(session.session_date), 'EEEE, MMMM do')}</span>
+                          </div>
+                        </div>
+                        <ChevronRight size={18} className="text-slate-300 group-hover:text-indigo-400" />
+                      </div>
+                    ))}
+                  </div>
+                </Card>
+              </div>
+            </motion.div>
+          )}
+
+          {activeScreen === 'workout' && (
+            <motion.div 
+              key="workout"
+              initial={{ opacity: 0, scale: 1.05 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="flex flex-col gap-6"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex flex-col">
+                  <h2 className="text-2xl font-bold tracking-tight text-slate-800">Active Workout</h2>
+                  <p className="text-slate-500 text-sm font-medium">{workoutDetail?.workout_day_name}</p>
+                </div>
+                <div className="px-3 py-1 bg-indigo-100 text-indigo-600 rounded-full text-xs font-bold animate-pulse">
+                  In Progress
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-6">
+                {activeExerciseLogs.map((exLog, exIdx) => (
+                  <Card key={exIdx} className="p-0 overflow-hidden border-2 border-slate-100">
+                    <div className="bg-slate-50 p-4 border-b border-slate-100 flex flex-col gap-1">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-widest">Exercise {exIdx + 1}</span>
+                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{exLog.target_sets} Sets • {exLog.target_reps} Reps</span>
+                      </div>
+                      <input 
+                        className="text-lg font-bold bg-transparent border-none p-0 focus:ring-0 w-full text-slate-800"
+                        value={exLog.performed_exercise_name}
+                        onChange={(e) => {
+                          const newLogs = [...activeExerciseLogs];
+                          newLogs[exIdx].performed_exercise_name = e.target.value;
+                          setActiveExerciseLogs(newLogs);
+                        }}
+                      />
+                      <p className="text-[10px] text-slate-400 font-medium italic">Programmed: {exLog.programmed_exercise_name}</p>
+                    </div>
+
+                    <div className="p-4 flex flex-col gap-4">
+                      <div className="grid grid-cols-4 gap-2 text-[10px] font-bold text-slate-400 uppercase tracking-widest px-2">
+                        <span>Set</span>
+                        <span>Weight (lb)</span>
+                        <span>Reps</span>
+                        <span className="text-right">Action</span>
+                      </div>
+
+                      <div className="flex flex-col gap-2">
+                        {exLog.sets.map((set: any, sIdx: number) => (
+                          <div key={sIdx} className="grid grid-cols-4 gap-2 items-center">
+                            <div className="w-8 h-8 bg-slate-100 rounded-lg flex items-center justify-center text-xs font-bold text-slate-600">
+                              {set.set_number}
+                            </div>
+                            <input 
+                              type="number"
+                              className="bg-slate-50 border border-slate-200 rounded-lg px-2 py-2 text-sm font-bold focus:ring-2 focus:ring-indigo-500/20"
+                              value={set.weight || ''}
+                              onChange={(e) => {
+                                const newLogs = [...activeExerciseLogs];
+                                newLogs[exIdx].sets[sIdx].weight = parseFloat(e.target.value) || 0;
+                                setActiveExerciseLogs(newLogs);
+                              }}
+                            />
+                            <input 
+                              type="number"
+                              className="bg-slate-50 border border-slate-200 rounded-lg px-2 py-2 text-sm font-bold focus:ring-2 focus:ring-indigo-500/20"
+                              value={set.reps || ''}
+                              onChange={(e) => {
+                                const newLogs = [...activeExerciseLogs];
+                                newLogs[exIdx].sets[sIdx].reps = parseInt(e.target.value) || 0;
+                                setActiveExerciseLogs(newLogs);
+                              }}
+                            />
+                            <div className="flex justify-end">
+                              <button 
+                                onClick={() => {
+                                  const newLogs = [...activeExerciseLogs];
+                                  newLogs[exIdx].sets.splice(sIdx, 1);
+                                  setActiveExerciseLogs(newLogs);
+                                }}
+                                className="p-2 text-slate-300 hover:text-rose-500 transition-colors"
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <Button 
+                        variant="outline" 
+                        className="py-2 text-xs border-dashed"
+                        onClick={() => {
+                          const newLogs = [...activeExerciseLogs];
+                          const lastSet = newLogs[exIdx].sets[newLogs[exIdx].sets.length - 1];
+                          newLogs[exIdx].sets.push({
+                            set_number: newLogs[exIdx].sets.length + 1,
+                            weight: lastSet?.weight || 0,
+                            reps: lastSet?.reps || 0,
+                            notes: ''
+                          });
+                          setActiveExerciseLogs(newLogs);
+                        }}
+                      >
+                        <Plus size={14} />
+                        Add Set
+                      </Button>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+
+              <div className="sticky bottom-4 left-0 right-0 flex flex-col gap-3 px-4 sm:px-0">
+                <Button onClick={completeWorkout} className="w-full py-4 text-lg shadow-2xl">
+                  <CheckCircle2 size={20} />
+                  Complete Workout
+                </Button>
+                <Button 
+                  variant="ghost" 
+                  onClick={() => { if(confirm('Cancel workout?')) setActiveScreen('home'); }}
+                  className="text-slate-400"
+                >
+                  Cancel Session
+                </Button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </main>
+
+      {/* Navigation (Mobile) */}
+      {activeScreen !== 'workout' && (
+        <nav className="sm:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-100 px-6 py-3 flex items-center justify-between z-40">
+          <NavIconButton active={activeScreen === 'home'} onClick={() => setActiveScreen('home')} icon={Home} label="Home" />
+          <NavIconButton active={activeScreen === 'calendar'} onClick={() => setActiveScreen('calendar')} icon={Calendar} label="Calendar" />
+          <NavIconButton active={activeScreen === 'progress'} onClick={() => setActiveScreen('progress')} icon={TrendingUp} label="Stats" />
+          <NavIconButton active={activeScreen === 'settings'} onClick={() => setActiveScreen('settings')} icon={User} label="Me" />
+        </nav>
+      )}
+
+      {/* Day Detail Modal */}
+      <DayDetailModal 
+        isOpen={isDayDetailOpen}
+        onClose={() => { setIsDayDetailOpen(false); setIsEditMode(false); }}
+        date={selectedDate}
+        detail={workoutDetail}
+        loading={loading}
+        isEditMode={isEditMode}
+        onEditToggle={() => setIsEditMode(!isEditMode)}
+        onMarkRestDay={() => markRestDay(selectedDate)}
+        onRestorePlan={() => restorePlan(selectedDate)}
+        onStartWorkout={() => startWorkout(workoutDetail)}
+        onSaveOverrides={(exercises) => saveExerciseOverrides(selectedDate, exercises)}
+      />
+    </div>
+  );
+}
+
+function NavIconButton({ active, onClick, icon: Icon, label }: { active: boolean, onClick: () => void, icon: any, label: string }) {
   return (
     <button 
       onClick={onClick}
       className={cn(
-        "p-2 rounded-xl transition-all relative",
+        "flex flex-col items-center gap-1 transition-all",
         active ? "text-indigo-600" : "text-slate-400"
       )}
     >
-      <Icon size={24} />
-      {active && (
-        <motion.div 
-          layoutId="bottom-nav-indicator"
-          className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-indigo-600"
-        />
-      )}
+      <Icon size={20} />
+      <span className="text-[10px] font-bold uppercase tracking-wider">{label}</span>
     </button>
   );
 }
 
-function CheckInModal({ 
+function CalendarView({ onDateSelect, userId }: { onDateSelect: (date: Date) => void, userId: string | null }) {
+  const [currentMonth, setCurrentMonth] = useState(new Date());
+  const [monthData, setMonthData] = useState<Record<string, any>>({});
+  const [loadingMonth, setLoadingMonth] = useState(false);
+
+  const start = startOfMonth(currentMonth);
+  const end = endOfMonth(currentMonth);
+  const days = eachDayOfInterval({ start, end });
+
+  useEffect(() => {
+    if (userId) {
+      fetchMonthData();
+    }
+  }, [currentMonth, userId]);
+
+  const fetchMonthData = async () => {
+    setLoadingMonth(true);
+    const data: Record<string, any> = {};
+    // Fetch in chunks to avoid overwhelming Supabase if needed, but 30 is usually fine
+    await Promise.all(days.map(async (day) => {
+      const detail = await getWorkoutDetailForDate(day, userId);
+      if (detail) {
+        data[detail.workout_date] = detail;
+      }
+    }));
+    setMonthData(data);
+    setLoadingMonth(false);
+  };
+
+  // Add padding for first day
+  const firstDayIdx = start.getDay();
+  const padding = Array.from({ length: firstDayIdx }).map((_, i) => null);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between px-2">
+        <div className="flex items-center gap-2">
+          <h4 className="font-bold text-slate-800">{format(currentMonth, 'MMMM yyyy')}</h4>
+          {loadingMonth && <div className="w-3 h-3 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />}
+        </div>
+        <div className="flex gap-1">
+          <button onClick={() => setCurrentMonth(addMonths(currentMonth, -1))} className="p-2 hover:bg-slate-100 rounded-lg"><ChevronLeft size={18} /></button>
+          <button onClick={() => setCurrentMonth(addMonths(currentMonth, 1))} className="p-2 hover:bg-slate-100 rounded-lg"><ChevronRight size={18} /></button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-7 gap-1">
+        {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map(d => (
+          <div key={d} className="text-center text-[10px] font-bold text-slate-400 py-2">{d}</div>
+        ))}
+        {padding.map((_, i) => <div key={`pad-${i}`} />)}
+        {days.map(day => {
+          const isTodayDate = isToday(day);
+          const dateKey = formatLocalYYYYMMDD(day);
+          const dayDetail = monthData[dateKey];
+
+          return (
+            <button 
+              key={day.toISOString()}
+              onClick={() => onDateSelect(day)}
+              className={cn(
+                "aspect-square rounded-xl flex flex-col items-center justify-center gap-0.5 transition-all border border-transparent overflow-hidden p-1",
+                isTodayDate ? "bg-indigo-600 text-white shadow-lg shadow-indigo-100" : "hover:bg-slate-50 hover:border-slate-100"
+              )}
+            >
+              <span className="text-sm font-bold">{format(day, 'd')}</span>
+              {dayDetail && (
+                <div className="flex flex-col items-center w-full">
+                  <span className={cn(
+                    "text-[7px] font-bold truncate w-full text-center leading-tight uppercase tracking-tighter",
+                    isTodayDate ? "text-indigo-100" : dayDetail.is_rest_day ? "text-slate-300" : dayDetail.is_error ? "text-rose-500" : "text-indigo-500"
+                  )}>
+                    {dayDetail.workout_day_name}
+                  </span>
+                  {dayDetail.workout_day_category && !isTodayDate && (
+                    <span className="text-[6px] text-slate-400 truncate w-full text-center leading-none">
+                      {dayDetail.workout_day_category}
+                    </span>
+                  )}
+                </div>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function DayDetailModal({ 
   isOpen, 
   onClose, 
-  onComplete 
-}: { 
-  isOpen: boolean; 
-  onClose: () => void; 
-  onComplete: (checkIn: WorkoutLog['checkIn']) => void;
-}) {
-  const [energy, setEnergy] = useState(3);
-  const [soreness, setSoreness] = useState(1);
-  const [difficulty, setDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
+  date, 
+  detail, 
+  loading, 
+  isEditMode,
+  onEditToggle,
+  onMarkRestDay,
+  onRestorePlan,
+  onStartWorkout,
+  onSaveOverrides
+}: any) {
+  const [editedExercises, setEditedExercises] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (detail?.exercises) {
+      setEditedExercises([...detail.exercises]);
+    }
+  }, [detail]);
 
   if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
       <motion.div 
-        initial={{ opacity: 0, scale: 0.9 }}
-        animate={{ opacity: 1, scale: 1 }}
-        className="bg-white rounded-3xl w-full max-w-md p-8 shadow-2xl"
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        className="bg-white rounded-3xl w-full max-w-lg p-6 shadow-2xl max-h-[90vh] overflow-hidden flex flex-col"
       >
-        <h3 className="text-2xl font-bold text-slate-800 mb-2">Great Work!</h3>
-        <p className="text-slate-500 mb-8">How are you feeling after this session?</p>
+        <div className="flex items-center justify-between mb-6 shrink-0">
+          <div className="flex flex-col">
+            <h3 className="text-xl font-bold text-slate-800">
+              {loading ? 'Loading...' : (detail?.workout_day_name || 'Rest Day')}
+            </h3>
+            <p className="text-slate-500 text-xs font-medium">
+              {format(date, 'EEEE, MMMM do')}
+              {detail?.workout_day_category && <span className="ml-2 text-indigo-500 font-bold">• {detail.workout_day_category}</span>}
+            </p>
+          </div>
+          <button onClick={onClose} className="p-2 text-slate-400 hover:bg-slate-50 rounded-lg">
+            <X size={20} />
+          </button>
+        </div>
 
-        <div className="flex flex-col gap-8">
-          <div className="flex flex-col gap-3">
-            <label className="text-sm font-bold text-slate-400 uppercase tracking-widest">Energy Level</label>
-            <div className="flex justify-between gap-2">
-              {[1, 2, 3, 4, 5].map(val => (
-                <button 
-                  key={val}
-                  onClick={() => setEnergy(val)}
-                  className={cn(
-                    "flex-1 py-3 rounded-xl font-bold transition-all",
-                    energy === val ? "bg-amber-400 text-white shadow-lg shadow-amber-100" : "bg-slate-50 text-slate-400"
-                  )}
-                >
-                  {val}
-                </button>
-              ))}
+        <div className="flex-1 overflow-y-auto pr-2 -mr-2 mb-6">
+          {loading ? (
+            <div className="flex flex-col items-center justify-center py-12 gap-4">
+              <div className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+              <p className="text-sm text-slate-400 font-medium">Fetching plan details...</p>
             </div>
-          </div>
-
-          <div className="flex flex-col gap-3">
-            <label className="text-sm font-bold text-slate-400 uppercase tracking-widest">Muscle Soreness</label>
-            <div className="flex justify-between gap-2">
-              {[1, 2, 3, 4, 5].map(val => (
-                <button 
-                  key={val}
-                  onClick={() => setSoreness(val)}
-                  className={cn(
-                    "flex-1 py-3 rounded-xl font-bold transition-all",
-                    soreness === val ? "bg-indigo-600 text-white shadow-lg shadow-indigo-100" : "bg-slate-50 text-slate-400"
+          ) : (
+            <div className="flex flex-col gap-6">
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Exercise List</h4>
+                  {detail?.has_overrides && (
+                    <span className="text-[10px] font-bold text-amber-600 bg-amber-50 px-2 py-0.5 rounded uppercase tracking-wider">Modified</span>
                   )}
-                >
-                  {val}
-                </button>
-              ))}
-            </div>
-          </div>
+                </div>
 
-          <div className="flex flex-col gap-3">
-            <label className="text-sm font-bold text-slate-400 uppercase tracking-widest">Difficulty</label>
-            <div className="flex gap-2">
-              {(['easy', 'medium', 'hard'] as const).map(val => (
-                <button 
-                  key={val}
-                  onClick={() => setDifficulty(val)}
-                  className={cn(
-                    "flex-1 py-3 rounded-xl font-bold transition-all capitalize",
-                    difficulty === val ? "bg-slate-800 text-white shadow-lg shadow-slate-100" : "bg-slate-50 text-slate-400"
+                {detail?.is_error ? (
+                  <div className="py-12 flex flex-col items-center justify-center text-center gap-3 bg-rose-50 rounded-3xl border border-dashed border-rose-200">
+                    <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center text-rose-500 shadow-sm">
+                      <AlertCircle size={24} />
+                    </div>
+                    <p className="text-sm text-rose-500 font-bold">
+                      Failed to load workout plan.
+                    </p>
+                  </div>
+                ) : !detail?.is_rest_day && editedExercises.length > 0 ? (
+                  <div className="flex flex-col gap-3">
+                    {editedExercises.map((ex, idx) => (
+                      <div key={idx} className="bg-slate-50 p-4 rounded-2xl border border-slate-100 flex flex-col gap-3">
+                        {isEditMode ? (
+                          <div className="flex flex-col gap-3">
+                            <Input 
+                              label="Exercise Name"
+                              value={ex.exercise_name}
+                              onChange={(e) => {
+                                const newEx = [...editedExercises];
+                                newEx[idx].exercise_name = e.target.value;
+                                setEditedExercises(newEx);
+                              }}
+                            />
+                            <div className="grid grid-cols-2 gap-3">
+                              <Input 
+                                label="Sets"
+                                type="number"
+                                value={ex.target_sets}
+                                onChange={(e) => {
+                                  const newEx = [...editedExercises];
+                                  newEx[idx].target_sets = parseInt(e.target.value) || 0;
+                                  setEditedExercises(newEx);
+                                }}
+                              />
+                              <Input 
+                                label="Reps"
+                                value={ex.target_reps}
+                                onChange={(e) => {
+                                  const newEx = [...editedExercises];
+                                  newEx[idx].target_reps = e.target.value;
+                                  setEditedExercises(newEx);
+                                }}
+                              />
+                            </div>
+                            <Button 
+                              variant="ghost" 
+                              className="text-rose-500 py-2 text-xs"
+                              onClick={() => {
+                                const newEx = editedExercises.filter((_, i) => i !== idx);
+                                setEditedExercises(newEx);
+                              }}
+                            >
+                              <Trash2 size={14} /> Remove
+                            </Button>
+                          </div>
+                        ) : (
+                          <div className="flex justify-between items-center">
+                            <div className="flex flex-col">
+                              <span className="text-sm font-bold text-slate-700">{ex.exercise_name}</span>
+                              <span className="text-[10px] font-medium text-slate-400 uppercase tracking-wider">{ex.target_sets} Sets • {ex.target_reps} Reps</span>
+                              {ex.notes && <span className="text-[10px] text-slate-400 italic mt-1">{ex.notes}</span>}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    {isEditMode && (
+                      <Button 
+                        variant="outline" 
+                        className="border-dashed py-3"
+                        onClick={() => setEditedExercises([...editedExercises, { exercise_name: 'New Exercise', target_sets: 3, target_reps: '10' }])}
+                      >
+                        <Plus size={16} /> Add Exercise
+                      </Button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="py-12 flex flex-col items-center justify-center text-center gap-3 bg-slate-50 rounded-3xl border border-dashed border-slate-200">
+                    <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center text-slate-300 shadow-sm">
+                      <Zap size={24} />
+                    </div>
+                    <p className="text-sm text-slate-400 font-medium italic">
+                      {detail?.is_rest_day ? 'Enjoy your rest day!' : 'No exercises scheduled.'}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-col gap-3 shrink-0">
+          {!loading && (
+            <>
+              {isEditMode ? (
+                <div className="grid grid-cols-2 gap-3">
+                  <Button variant="outline" onClick={onEditToggle}>Cancel</Button>
+                  <Button onClick={() => onSaveOverrides(editedExercises)}>Save Changes</Button>
+                </div>
+              ) : (
+                <>
+                  {!detail?.is_rest_day && (
+                    <Button onClick={onStartWorkout} className="w-full py-4 text-lg">
+                      <Play size={18} fill="currentColor" />
+                      Start Workout
+                    </Button>
                   )}
-                >
-                  {val}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-3 mt-4">
-            <Button onClick={() => onComplete({ energy, soreness, difficulty })} className="w-full py-4 text-lg">
-              Save & Finish
-            </Button>
-            <button onClick={onClose} className="text-slate-400 font-semibold text-sm py-2">
-              Go back to workout
-            </button>
-          </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <Button variant="outline" onClick={onEditToggle} className="text-sm">
+                      <Edit3 size={16} />
+                      Edit Plan
+                    </Button>
+                    <Button variant="outline" onClick={onMarkRestDay} className="text-sm">
+                      <Activity size={16} />
+                      {detail?.is_rest_day ? 'Set Workout' : 'Mark Rest'}
+                    </Button>
+                  </div>
+                  {detail?.has_overrides && (
+                    <Button variant="ghost" onClick={onRestorePlan} className="text-rose-500 text-xs py-2">
+                      <RotateCcw size={14} />
+                      Restore Original Plan
+                    </Button>
+                  )}
+                </>
+              )}
+            </>
+          )}
         </div>
       </motion.div>
     </div>

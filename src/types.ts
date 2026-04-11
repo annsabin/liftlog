@@ -1,55 +1,92 @@
-export type WorkoutType = 'Lower' | 'Upper' | 'Cardio/Core' | 'Active Recovery' | 'Rest';
-
-export interface ExerciseVariation {
+export interface Profile {
   id: string;
-  name: string;
-  equipment: ('dumbbells' | 'barbell' | 'machines' | 'bodyweight')[];
+  email: string;
+  full_name?: string;
+  created_at: string;
 }
 
-export interface ExerciseDefinition {
+export interface Program {
   id: string;
   name: string;
-  variations: ExerciseVariation[];
+  description?: string;
+  created_at: string;
 }
 
-export interface Gym {
+export interface WorkoutDay {
   id: string;
+  program_id: string;
+  day_number: number;
   name: string;
-  equipment: {
-    dumbbells: boolean;
-    barbell: boolean;
-    machines: boolean;
-  };
+  description?: string;
+}
+
+export interface WorkoutDayExercise {
+  id: string;
+  workout_day_id: string;
+  exercise_name: string;
+  target_sets: number;
+  target_reps: string;
+  sequence_order: number;
+}
+
+export interface WorkoutDayOverride {
+  id: string;
+  date: string;
+  workout_day_id?: string;
+  is_rest_day: boolean;
+  custom_day_name?: string;
+  created_at: string;
+}
+
+export interface WorkoutExerciseOverride {
+  id: string;
+  date: string;
+  exercise_name: string;
+  target_sets: number;
+  target_reps: string;
+  sequence_order: number;
+  notes?: string;
+  created_at: string;
+  action?: 'add' | 'remove' | 'replace' | 'edit';
+  new_exercise_name?: string;
+  weight_text?: string;
+}
+
+export interface WorkoutSession {
+  id: string;
+  user_id: string;
+  workout_day_id: string;
+  session_date: string;
+  gym_name: string;
+  completed: boolean;
+  created_at: string;
+}
+
+export interface ExerciseLog {
+  id: string;
+  session_id: string;
+  programmed_exercise_name: string;
+  performed_exercise_name: string;
+  modification_note?: string;
+  sequence_order: number;
+  created_at: string;
 }
 
 export interface SetLog {
   id: string;
+  exercise_log_id: string;
+  set_number: number;
   weight: number;
   reps: number;
+  notes?: string;
+  created_at: string;
 }
 
-export interface ExerciseLog {
-  exerciseId: string;
-  variationId: string;
-  sets: SetLog[];
-}
-
-export interface WorkoutLog {
+export interface CheckIn {
   id: string;
-  date: string; // ISO string
-  type: WorkoutType;
-  gymId: string;
-  exercises: ExerciseLog[];
-  checkIn?: {
-    energy: number; // 1-5
-    soreness: number; // 1-5
-    difficulty: 'easy' | 'medium' | 'hard';
-  };
-}
-
-export interface AppState {
-  gyms: Gym[];
-  selectedGymId: string;
-  workoutLogs: WorkoutLog[];
-  startDate: string; // The date when Day 1 of the 10-day plan started
+  session_id: string;
+  energy: number;
+  soreness: number;
+  difficulty: 'easy' | 'medium' | 'hard';
+  created_at: string;
 }
